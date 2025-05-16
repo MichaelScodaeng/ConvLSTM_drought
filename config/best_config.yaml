@@ -1,0 +1,38 @@
+aft_seq_length: 1
+batch_size: 16
+dropout: 0.0
+epochs: 5
+hidden_dim: 32
+kernel_size:
+- 5
+- 5
+lr: 1.8259021657893956e-06
+num_layers: 3
+pre_seq_length: 20
+weight_decay: 0.0012938575506968146
+feature_cols:
+  - pet
+  - pre
+  - tmx
+  - tmn
+  - tmp
+  - cld
+  - dmi
+  - soi
+  - nino3
+  - nino4
+  - nino34
+  - pdo
+
+target_cols: 
+  - spei
+
+lat_key: lat
+lon_key: lon
+time_key: time
+
+spatial_dim:
+  - 30
+  - 17
+
+scale_range: [-1, 1]

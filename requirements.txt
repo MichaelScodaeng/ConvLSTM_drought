@@ -1,0 +1,27 @@
+# Core dependencies
+# Note: Install PyTorch, TorchVision, and TorchAudio with CUDA support using:
+# pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
+
+# Core libraries
+numpy
+pandas
+matplotlib
+scikit-learn
+tensorboardX
+tensorboard
+
+# Optional: Mixed precision and training utilities
+pytorch-lightning
+
+# Hyperparameter tuning
+optuna
+
+# Plotting & visualization
+seaborn
+tqdm
+
+# Optional: Jupyter support (if needed)
+jupyter
+
+# Optional: Type checking and LSP (for better VS Code experience)
+pyright

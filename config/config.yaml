@@ -1,0 +1,27 @@
+# config.yaml
+
+feature_cols:
+  - pet
+  - pre
+  - tmx
+  - tmn
+  - tmp
+  - cld
+  - dmi
+  - soi
+  - nino3
+  - nino4
+  - nino34
+  - pdo
+
+target_cols: 
+  - spei
+
+lat_key: lat
+lon_key: lon
+time_key: time
+spatial_dim:
+  - 30
+  - 17
+
+scale_range: [-1, 1]
