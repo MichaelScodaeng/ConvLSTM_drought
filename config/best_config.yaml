@@ -1,15 +1,15 @@
 aft_seq_length: 1
 batch_size: 16
 dropout: 0.0
-epochs: 5
-hidden_dim: 32
+epochs: 50
+hidden_dim: 256
 kernel_size:
 - 5
 - 5
-lr: 1.8259021657893956e-06
+lr: 2.00e-05
 num_layers: 3
 pre_seq_length: 20
-weight_decay: 0.0012938575506968146
+weight_decay: 0.001
 feature_cols:
   - pet
   - pre
