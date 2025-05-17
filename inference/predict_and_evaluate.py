@@ -40,7 +40,7 @@ from utils.scaler import inverse_scale_gridded_tensor
 from utils.load_config import load_config
 
 @torch.no_grad()
-def evaluate_model(model, dataloader, scaler_y, device):
+def evaluate_model(model, dataloader, scaler_y, mask, device):
     preds_all, targets_all = [], []
 
     for x, y, _ in dataloader:
@@ -73,10 +73,17 @@ def evaluate_model(model, dataloader, scaler_y, device):
     # Stack: [N, T, H, W]
     preds_all = np.stack(preds_all)
     targets_all = np.stack(targets_all)
+    # preds_all, targets_all are [N, T, H, W]
+    mask = mask.astype(bool)  # [H, W]
+
+    # Broadcast and mask invalid positions
+    preds_all_masked = preds_all[:, :, mask]
+    targets_all_masked = targets_all[:, :, mask]
+
 
     # Compute metrics only on non-NaNs
-    rmse = masked_rmse(targets_all, preds_all)
-    r2 = masked_r2(targets_all, preds_all)
+    rmse = masked_rmse(targets_all_masked, preds_all_masked)
+    r2 = masked_r2(targets_all_masked, preds_all_masked)
 
     print("🔍 Shapes:", preds_all.shape, targets_all.shape)
     print("✅ Inverse scaling complete")
@@ -135,20 +142,20 @@ def main(config_path):
     lat_idx, lon_idx = mask_indices[0]  # First valid cell
     print(f"Plotting valid location: lat={lat_idx}, lon={lon_idx}")
     print("🔍 Train Set")
-    train_preds, train_targets, train_rmse, train_r2 = evaluate_model(model, train_loader, scaler_y, device)
+    train_preds, train_targets, train_rmse, train_r2 = evaluate_model(model, train_loader, scaler_y,mask, device)
     print(f"✅ RMSE: {train_rmse:.4f} | R²: {train_r2:.4f}")
     train_save_path = os.path.join("outputs/train", f"{target_name}")
     save_results(train_preds, train_targets, train_save_path, "train")
 
 
     print("🔍 Validation Set")
-    val_preds, val_targets, val_rmse, val_r2 = evaluate_model(model, val_loader, scaler_y, device)
+    val_preds, val_targets, val_rmse, val_r2 = evaluate_model(model, val_loader, scaler_y,mask, device)
     print(f"✅ RMSE: {val_rmse:.4f} | R²: {val_r2:.4f}")
     val_save_path = os.path.join("outputs/val", f"{target_name}")
     save_results(val_preds, val_targets, val_save_path, "val")
 
     print("🧪 Test Set")
-    test_preds, test_targets, test_rmse, test_r2 = evaluate_model(model, test_loader, scaler_y, device)
+    test_preds, test_targets, test_rmse, test_r2 = evaluate_model(model, test_loader, scaler_y,mask, device)
     test_save_path = os.path.join("outputs/test", f"{target_name}")
     print(f"✅ RMSE: {test_rmse:.4f} | R²: {test_r2:.4f}")
     save_results(test_preds, test_targets, test_save_path, "test")
@@ -159,7 +166,7 @@ def main(config_path):
     print("val_targets[0] values:", val_targets[0])
     print("Any NaN in preds?", np.isnan(val_preds[0]).any())
     print("Any NaN in targets?", np.isnan(val_targets[0]).any())
-    lat_idx, lon_idx = 0, 7
+
     plt.plot(val_targets[0, :, lat_idx, lon_idx], label="Ground Truth")
     plt.plot(val_preds[0, :, lat_idx, lon_idx], label="Prediction", linestyle="--")
     plt.legend()
@@ -169,7 +176,7 @@ def main(config_path):
     plot_prediction_vs_actual(val_preds[0], val_targets[0], save_path=os.path.join(val_save_path, "val_sample0.png"))
     save_pred_vs_actual_csv(
     val_preds, val_targets,
-    h=0, w=7,
+    h=lat_idx, w=lon_idx,
     save_path=os.path.join(val_save_path, "val_pred_vs_actual_lat15_lon8.csv")
 )
 import pandas as pd
@@ -200,3 +207,4 @@ if __name__ == "__main__":
     parser.add_argument('--config_path', type=str, required=True)
     args = parser.parse_args()
     main(args.config_path)
+    print("✅ All done!")
