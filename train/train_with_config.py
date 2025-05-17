@@ -67,7 +67,6 @@ def main(config_path):
         timestamps_train=timestamps_train,
         timestamps_val=timestamps_val,
         timestamps_test=timestamps_test,
-        mask=mask
     )
     
     # Ensure kernel_size is in the correct format

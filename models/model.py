@@ -406,12 +406,12 @@ class LightningConvLSTMModule(pl.LightningModule):
         return self.model(x)
 
     def _shared_step(self, batch, stage):
-        x, y, mask = batch  # x: [B, T_in, C, H, W], y: [B, T_out, C, H, W], mask: [B, 1, H, W]
+        x, y = batch  # x: [B, T_in, C, H, W], y: [B, T_out, C, H, W]
+        # Note: We've removed mask from the batch unpacking
 
         # Replace NaNs to prevent propagation
         x = torch.nan_to_num(x, nan=0.0)
         y = torch.nan_to_num(y, nan=0.0)
-        mask = torch.nan_to_num(mask, nan=0.0)
 
         # Forward pass
         with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
@@ -426,54 +426,48 @@ class LightningConvLSTMModule(pl.LightningModule):
             y_hat_original = inverse_transform(y_hat, self.X_min, self.X_max) 
             y_original = inverse_transform(y, self.X_min, self.X_max)
 
-            # Expand mask to match prediction shape
-            expanded_mask = mask.unsqueeze(1).expand_as(y_hat)  # [B, T, 1, H, W]
-            valid_pixel_count = expanded_mask.sum()
-
-            if valid_pixel_count == 0:
-                print(f"[{stage}] ⚠️ Skipping batch with no valid mask.")
-                return torch.tensor(0.0, requires_grad=True, device=self.device)
-
-            # Compute masked loss in ORIGINAL space (for metrics)
-            masked_mse_original = ((y_hat_original - y_original) ** 2) * expanded_mask
-            loss_original = masked_mse_original.sum() / (valid_pixel_count + 1e-8)
+            # Compute loss directly without masking
+            # For original space (for metrics)
+            loss_original = torch.mean((y_hat_original - y_original) ** 2)
 
             # Also compute loss in SCALED space (for backprop stability)
-            masked_mse_scaled = ((y_hat - y) ** 2) * expanded_mask
-            loss_scaled = masked_mse_scaled.sum() / (valid_pixel_count + 1e-8)
+            loss_scaled = torch.mean((y_hat - y) ** 2)
 
             # We'll log the original loss but use the scaled loss for backprop
             self.log(f"{stage}_loss", loss_original, on_step=False, on_epoch=True)
             self.log(f"{stage}_scaled_loss", loss_scaled, on_step=False, on_epoch=True)
 
-            # Extract valid predictions and targets for metrics
-            pred_valid = y_hat_original[expanded_mask.bool()].detach()
-            true_valid = y_original[expanded_mask.bool()].detach()
-
-            # Update metrics
+            # Update metrics with all predictions (no masking)
             rmse_metric = getattr(self, f"{stage}_rmse")
             r2_metric = getattr(self, f"{stage}_r2")
             
-            rmse_metric.update(pred_valid, true_valid)
-            r2_metric.update(pred_valid, true_valid)
+            rmse_metric.update(y_hat_original, y_original)
+            r2_metric.update(y_hat_original, y_original)
 
             # Log sample stats for first batch of training
             if self.global_step == 0 and stage == "train":
                 print("\n📊 Sample stats:")
-                print(f"x shape: {x.shape}, y shape: {y.shape}, mask shape: {mask.shape}")
+                print(f"x shape: {x.shape}, y shape: {y.shape}")
                 print(f"y_hat shape: {y_hat.shape}")
                 print(f"x min/max: {x.min().item():.4f}/{x.max().item():.4f}")
                 print(f"y min/max: {y.min().item():.4f}/{y.max().item():.4f}")
                 print(f"y_hat min/max: {y_hat.min().item():.4f}/{y_hat.max().item():.4f}")
                 print(f"y_original min/max: {y_original.min().item():.4f}/{y_original.max().item():.4f}")
                 print(f"y_hat_original min/max: {y_hat_original.min().item():.4f}/{y_hat_original.max().item():.4f}")
-                print(f"mask valid %: {mask.sum().item() / mask.numel() * 100:.2f}%")
                 print(f"Original scale loss: {loss_original.item():.6f}")
                 print(f"Scaled loss: {loss_scaled.item():.6f}")
 
             # Log metrics
             self.log(f"{stage}_rmse", rmse_metric.compute(), prog_bar=True, on_step=False, on_epoch=True)
             self.log(f"{stage}_r2", r2_metric.compute(), prog_bar=True, on_step=False, on_epoch=True)
+
+        # Clear memory
+        if stage != "train":
+            torch.cuda.empty_cache()
+            gc.collect()
+
+        # Return the SCALED loss for backprop stability (not the original loss)
+        return loss_scaled if stage == "train" else None
 
         # Clear memory
         if stage != "train":
