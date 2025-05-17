@@ -4,6 +4,84 @@ import pytorch_lightning as pl
 import torchmetrics
 import gc
 
+def weights_init(m):
+    """
+    More conservative initialization for model weights to help with training.
+    Apply this to model with: model.apply(weights_init)
+    """
+    if isinstance(m, nn.Conv2d):
+        # Use more conservative Kaiming initialization for Conv2d layers
+        nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu', a=0.1)
+        if m.bias is not None:
+            # Initialize bias with zeros to prevent instability
+            nn.init.zeros_(m.bias)
+    elif isinstance(m, nn.BatchNorm2d):
+        nn.init.constant_(m.weight, 1.0)
+        nn.init.constant_(m.bias, 0.0)
+    elif isinstance(m, nn.LSTM) or isinstance(m, nn.LSTMCell):
+        # More conservative LSTM initialization
+        for name, param in m.named_parameters():
+            if 'weight_ih' in name:
+                nn.init.xavier_uniform_(param, gain=0.5)  # Lower gain for stability
+            elif 'weight_hh' in name:
+                nn.init.orthogonal_(param, gain=0.5)  # Lower gain for stability
+            elif 'bias' in name:
+                nn.init.zeros_(param)  # Start with zeros
+
+# Add this method to EncodingForecastingConvLSTM
+def initialize_skip_connections(self):
+    """Initialize skip connections with small weights to prevent large initial outputs"""
+    nn.init.normal_(self.skip_conv.weight, mean=0.0, std=0.01)
+    if self.skip_conv.bias is not None:
+        nn.init.zeros_(self.skip_conv.bias)
+    
+    nn.init.normal_(self.conv_last.weight, mean=0.0, std=0.01)
+    if self.conv_last.bias is not None:
+        nn.init.zeros_(self.conv_last.bias)
+
+# Add this to the LightningConvLSTMModule class
+def configure_optimizers(self):
+    # Use AdamW with more stable settings
+    optimizer = torch.optim.AdamW(
+        self.parameters(), 
+        lr=self.lr / 10,  # Start with lower learning rate
+        weight_decay=self.weight_decay,
+        eps=1e-8  # Larger epsilon for stability
+    )
+    
+    # Calculate number of training steps
+    if self.trainer is not None and hasattr(self.trainer, 'estimated_stepping_batches'):
+        steps = self.trainer.estimated_stepping_batches
+    else:
+        steps = 1000  # Default fallback
+    
+    # Use OneCycleLR scheduler for better convergence
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=self.lr,
+        total_steps=steps,
+        pct_start=0.3,  # 30% warmup
+        div_factor=25,  # initial_lr = max_lr/25
+        final_div_factor=1000,  # final_lr = max_lr/1000
+        anneal_strategy='cos'
+    )
+    
+    return {
+        "optimizer": optimizer,
+        "lr_scheduler": {
+            "scheduler": scheduler,
+            "interval": "step"
+        }
+    }
+
+# Add this to your training code
+def train_with_gradient_clipping(self):
+    self.trainer = pl.Trainer(
+        max_epochs=100,
+        callbacks=[pl.callbacks.EarlyStopping(monitor='val_loss', patience=10)],
+        gradient_clip_val=1.0,  # Add gradient clipping
+        gradient_clip_algorithm="norm"
+    )
 
 def inverse_transform(scaled_data, X_min, X_max):
     """
@@ -17,10 +95,13 @@ def inverse_transform(scaled_data, X_min, X_max):
     Returns:
         Tensor with values in original scale
     """
-    X_min =  [-6.762784]
-    X_min = torch.tensor(X_min, dtype=scaled_data.dtype, device=scaled_data.device)
-    X_max = [3.886915]
-    X_max = torch.tensor(X_max, dtype=scaled_data.dtype, device=scaled_data.device)
+    X_min= -6.762784
+    X_max= 3.886915
+    # Ensure X_min and X_max are tensors
+    if not isinstance(X_min, torch.Tensor):
+        X_min = torch.tensor(X_min, dtype=scaled_data.dtype, device=scaled_data.device)
+    if not isinstance(X_max, torch.Tensor):
+        X_max = torch.tensor(X_max, dtype=scaled_data.dtype, device=scaled_data.device)
     X_min_tensor = torch.full_like(scaled_data, X_min.item(), dtype=scaled_data.dtype, device=scaled_data.device)
     X_max_tensor = torch.full_like(scaled_data, X_max.item(), dtype=scaled_data.dtype, device=scaled_data.device)
     # Perform the inverse transformation
@@ -32,6 +113,28 @@ def inverse_transform(scaled_data, X_min, X_max):
         torch.div(torch.add(X_max_tensor, X_min_tensor), 2)
     )
     return inv_data
+
+
+def weights_init(m):
+    """
+    Custom initialization for model weights to help with training.
+    Apply this to model with: model.apply(weights_init)
+    """
+    if isinstance(m, nn.Conv2d):
+        # Use Kaiming initialization for Conv2d layers
+        nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+        if m.bias is not None:
+            # Initialize bias with small positive values to prevent dead neurons
+            nn.init.constant_(m.bias, 0.01)
+    elif isinstance(m, nn.LSTM) or isinstance(m, nn.LSTMCell):
+        # Special initialization for LSTM weights
+        for name, param in m.named_parameters():
+            if 'weight_ih' in name:
+                nn.init.xavier_uniform_(param)
+            elif 'weight_hh' in name:
+                nn.init.orthogonal_(param)
+            elif 'bias' in name:
+                nn.init.constant_(param, 0.0)
 
 
 class ConvLSTMCell(nn.Module):
@@ -48,6 +151,15 @@ class ConvLSTMCell(nn.Module):
                               kernel_size=self.kernel_size,
                               padding=self.padding,
                               bias=self.bias)
+        
+        # Apply custom initialization
+        self.reset_parameters()
+        
+    def reset_parameters(self):
+        # Custom initialization for the conv layer
+        nn.init.xavier_uniform_(self.conv.weight)
+        if self.bias:
+            nn.init.zeros_(self.conv.bias)
 
     def forward(self, input_tensor, cur_state):
         h_cur, c_cur = cur_state
@@ -95,6 +207,12 @@ class ConvLSTM(nn.Module):
                          bias=self.bias)
             for i in range(self.num_layers)
         ])
+        
+        # Use BatchNorm to help with training stability
+        self.batchnorm = nn.ModuleList([
+            nn.BatchNorm2d(hidden_dim[i]) for i in range(self.num_layers)
+        ])
+        
         self.dropout_layer = nn.Dropout(p=dropout) if dropout > 0 else nn.Identity()
 
     def forward(self, input_tensor, hidden_state=None):
@@ -104,7 +222,7 @@ class ConvLSTM(nn.Module):
 
         b, _, _, h, w = input_tensor.size()
         
-        # Initialize hidden state if not provided or incorrect size
+        # Initialize hidden state if not provided
         if hidden_state is None:
             hidden_state = self._init_hidden(b, (h, w))
         
@@ -121,8 +239,14 @@ class ConvLSTM(nn.Module):
             output_inner = []
             for t in range(input_tensor.size(1)):
                 h, c = self.cell_list[layer_idx](input_tensor=cur_layer_input[:, t], cur_state=[h, c])
+                
+                # Apply BatchNorm and dropout for training stability
+                if self.training:
+                    h = self.batchnorm[layer_idx](h)
                 h = self.dropout_layer(h)
+                
                 output_inner.append(h)
+                
             layer_output = torch.stack(output_inner, dim=1)
             cur_layer_input = layer_output
             layer_output_list.append(layer_output)
@@ -189,11 +313,25 @@ class EncodingForecastingConvLSTM(nn.Module):
             return_all_layers=False,
             dropout=dropout
         )
+        
+        # Add skip connection for better gradient flow
+        self.skip_conv = nn.Conv2d(
+            in_channels=input_dim,
+            out_channels=1,
+            kernel_size=1
+        )
 
-        self.conv_last = nn.Conv2d(in_channels=hidden_dim[-1], out_channels=1, kernel_size=1)
+        self.conv_last = nn.Conv2d(
+            in_channels=hidden_dim[-1], 
+            out_channels=1, 
+            kernel_size=1
+        )
 
         self.pre_seq_length = pre_seq_length
         self.aft_seq_length = aft_seq_length
+        
+        # Apply weight initialization
+        self.apply(weights_init)
 
     def forward(self, input_tensor):
         """
@@ -204,6 +342,9 @@ class EncodingForecastingConvLSTM(nn.Module):
         """
         assert input_tensor.dim() == 5, f"Expected input_tensor to be 5D [B, T, C, H, W], got {input_tensor.shape}"
 
+        # Save first input frame for skip connection
+        first_input = input_tensor[:, 0]
+        
         # Encoder phase
         encoder_outputs, encoder_states = self.encoder(input_tensor)
 
@@ -222,7 +363,13 @@ class EncodingForecastingConvLSTM(nn.Module):
         for t in range(self.aft_seq_length):
             forecaster_output, forecaster_states = self.forecaster(next_input, forecaster_states)
             hidden_state = forecaster_output[-1][:, -1]  # [B, hidden_dim, H, W]
-            pred = self.conv_last(hidden_state)  # [B, 1, H, W]
+            
+            # Apply skip connection from first input frame
+            pred = self.conv_last(hidden_state) + self.skip_conv(first_input)
+            
+            # Add tanh activation to constrain output to [-1, 1] range
+            pred = torch.tanh(pred)
+            
             predictions.append(pred)
             
             # Use latest prediction as next input
@@ -287,13 +434,17 @@ class LightningConvLSTMModule(pl.LightningModule):
                 print(f"[{stage}] ⚠️ Skipping batch with no valid mask.")
                 return torch.tensor(0.0, requires_grad=True, device=self.device)
 
-            # Compute masked loss on ORIGINAL scale
-            masked_mse = ((y_hat_original - y_original) ** 2) * expanded_mask
-            loss = masked_mse.sum() / (valid_pixel_count + 1e-8)
+            # Compute masked loss in ORIGINAL space (for metrics)
+            masked_mse_original = ((y_hat_original - y_original) ** 2) * expanded_mask
+            loss_original = masked_mse_original.sum() / (valid_pixel_count + 1e-8)
 
-            # Also compute metrics on scaled data for comparison
-            scaled_masked_mse = ((y_hat - y) ** 2) * expanded_mask
-            scaled_loss = scaled_masked_mse.sum() / (valid_pixel_count + 1e-8)
+            # Also compute loss in SCALED space (for backprop stability)
+            masked_mse_scaled = ((y_hat - y) ** 2) * expanded_mask
+            loss_scaled = masked_mse_scaled.sum() / (valid_pixel_count + 1e-8)
+
+            # We'll log the original loss but use the scaled loss for backprop
+            self.log(f"{stage}_loss", loss_original, on_step=False, on_epoch=True)
+            self.log(f"{stage}_scaled_loss", loss_scaled, on_step=False, on_epoch=True)
 
             # Extract valid predictions and targets for metrics
             pred_valid = y_hat_original[expanded_mask.bool()].detach()
@@ -317,23 +468,20 @@ class LightningConvLSTMModule(pl.LightningModule):
                 print(f"y_original min/max: {y_original.min().item():.4f}/{y_original.max().item():.4f}")
                 print(f"y_hat_original min/max: {y_hat_original.min().item():.4f}/{y_hat_original.max().item():.4f}")
                 print(f"mask valid %: {mask.sum().item() / mask.numel() * 100:.2f}%")
-                print(f"Original scale loss: {loss.item():.6f}")
-                print(f"Scaled loss: {scaled_loss.item():.6f}")
+                print(f"Original scale loss: {loss_original.item():.6f}")
+                print(f"Scaled loss: {loss_scaled.item():.6f}")
 
             # Log metrics
-            self.log(f"{stage}_loss", loss, on_step=False, on_epoch=True)
             self.log(f"{stage}_rmse", rmse_metric.compute(), prog_bar=True, on_step=False, on_epoch=True)
             self.log(f"{stage}_r2", r2_metric.compute(), prog_bar=True, on_step=False, on_epoch=True)
-            
-            # Additional logging
-            self.log(f"{stage}_scaled_loss", scaled_loss, on_step=False, on_epoch=True)
 
         # Clear memory
         if stage != "train":
             torch.cuda.empty_cache()
             gc.collect()
 
-        return loss
+        # Return the SCALED loss for backprop stability (not the original loss)
+        return loss_scaled if stage == "train" else None
 
     def training_step(self, batch, batch_idx):
         loss = self._shared_step(batch, "train")
@@ -346,25 +494,35 @@ class LightningConvLSTMModule(pl.LightningModule):
         self._shared_step(batch, "test")
 
     def configure_optimizers(self):
+        # Use OneCycleLR for better convergence
         optimizer = torch.optim.AdamW(
             self.parameters(), 
             lr=self.lr, 
             weight_decay=self.weight_decay
         )
         
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, 
-            patience=5, 
-            factor=0.5,
+        # Calculate number of training steps
+        if self.trainer is not None and hasattr(self.trainer, 'estimated_stepping_batches'):
+            steps = self.trainer.estimated_stepping_batches
+        else:
+            steps = 1000  # Default fallback
+        
+        # Use OneCycleLR scheduler for better convergence
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=self.lr,
+            total_steps=steps,
+            pct_start=0.3,  # 30% warmup
+            div_factor=25,  # initial_lr = max_lr/25
+            final_div_factor=1000,  # final_lr = max_lr/1000
+            anneal_strategy='cos'
         )
         
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
-                "monitor": "val_loss",
-                "interval": "epoch",
-                "frequency": 1
+                "interval": "step"
             }
         }
 
