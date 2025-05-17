@@ -33,76 +33,55 @@ def load_model_from_checkpoint(config, grid_X_train,checkpoint_path, device):
     return model
 
 
-@torch.no_grad()
+import numpy as np
+import torch
+from utils.metrics import masked_rmse, masked_r2
+from utils.scaler import inverse_scale_gridded_tensor
+from utils.load_config import load_config
+
 @torch.no_grad()
 def evaluate_model(model, dataloader, scaler_y, device):
     preds_all, targets_all = [], []
-    output = None
-    for x, y, mask_batch in dataloader:
-        x, y = x.to(device), y.to(device)
-        output = model(x)
-        if torch.isnan(x).any():
-            print("⚠️ Input to model contains NaNs")
 
-        output = model(x)
+    for x, y, _ in dataloader:
+        x, y = x.to(device), y.to(device)  # [B, T_in, C, H, W], [B, T_out, 1, H, W]
+        preds = model(x)                   # [B, T_out, 1, H, W]
 
-        if torch.isnan(output).any():
-            print("🚨 Model output contains NaNs")
-        preds_all.append(output.cpu())
-        targets_all.append(y.cpu())
-    print("Sample output:", output[0].cpu().numpy())
-    preds = torch.cat(preds_all, dim=0).numpy()     # (B, T, C, H, W)
-    targets = torch.cat(targets_all, dim=0).numpy() # (B, T, C, H, W)
+        # Check for NaNs
+        if torch.isnan(preds).any():
+            print("🚨 NaNs detected in model predictions")
 
-    B, T, C, H, W = preds.shape
+        preds = preds.cpu().numpy()
+        y = y.cpu().numpy()
 
-    # Make sure C == 1
-    assert C == 1, f"Expected C=1, got {C}"
-    #load npz mask
-    config = load_config("config/config.yaml")
-    target_name = "_".join(config["target_cols"])
-    mask = np.load(f"data/preprocessed/{target_name}/data_{target_name}.npz")["mask"]
+        for i in range(preds.shape[0]):  # Loop over batch
+            pred_batch = preds[i]        # [T, 1, H, W]
+            target_batch = y[i]          # [T, 1, H, W]
 
-    # Reshape to (B * H * W, T)
-    preds_flat = preds.reshape(B, T, C, H, W).transpose(0, 3, 4, 2, 1).reshape(-1, T)  # (B*H*W, T)
-    targets_flat = targets.reshape(B, T, C, H, W).transpose(0, 3, 4, 2, 1).reshape(-1, T)
+            # Convert to [T, H, W, 1]
+            pred_4d = np.transpose(pred_batch, (0, 2, 3, 1))
+            target_4d = np.transpose(target_batch, (0, 2, 3, 1))
 
-    print(f"Mask shape: {mask.shape}, dtype: {mask.dtype}")
-    print(f"Mask valid count: {np.sum(mask)}, total: {mask.size}")
-    print(f"Mask preview:\n{mask.astype(int)}")
+            # Inverse transform
+            pred_inv = inverse_scale_gridded_tensor(pred_4d, scaler_y)
+            target_inv = inverse_scale_gridded_tensor(target_4d, scaler_y)
 
+            # Back to [T, H, W]
+            preds_all.append(pred_inv[..., 0])
+            targets_all.append(target_inv[..., 0])
 
-    print(f"preds_flat min/max before inverse: {np.min(preds_flat)}, {np.max(preds_flat)}")
-    print(f"targets_flat min/max before inverse: {np.min(targets_flat)}, {np.max(targets_flat)}")
-    print(f"preds_flat NaN count: {np.isnan(preds_flat).sum()}")
-    print(f"targets_flat NaN count: {np.isnan(targets_flat).sum()}")
-    
+    # Stack: [N, T, H, W]
+    preds_all = np.stack(preds_all)
+    targets_all = np.stack(targets_all)
 
-    preds_inv = scaler_y.inverse_transform(preds_flat).reshape(B, H, W, T)
-    targets_inv = scaler_y.inverse_transform(targets_flat).reshape(B, H, W, T)
+    # Compute metrics only on non-NaNs
+    rmse = masked_rmse(targets_all, preds_all)
+    r2 = masked_r2(targets_all, preds_all)
 
+    print("🔍 Shapes:", preds_all.shape, targets_all.shape)
+    print("✅ Inverse scaling complete")
 
-
-    # Transpose to (B, T, H, W) for metric consistency
-    preds_inv = preds_inv.transpose(0, 3, 1, 2)
-    targets_inv = targets_inv.transpose(0, 3, 1, 2)
-    print("🔍 DEBUG SHAPES:")
-    print(f"preds_inv.shape: {preds_inv.shape}")     # Expect: (B, T, H, W)
-    print(f"targets_inv.shape: {targets_inv.shape}")
-
-    print("🔍 DEBUG STATS:")
-    print(f"preds_inv min/max: {np.nanmin(preds_inv)} / {np.nanmax(preds_inv)}")
-    print(f"targets_inv min/max: {np.nanmin(targets_inv)} / {np.nanmax(targets_inv)}")
-
-    print(f"preds_inv NaN count: {np.isnan(preds_inv).sum()}")
-    print(f"targets_inv NaN count: {np.isnan(targets_inv).sum()}")
-
-    rmse = masked_rmse(targets_inv, preds_inv)
-    r2 = masked_r2(targets_inv, preds_inv)
-
-
-
-    return preds_inv, targets_inv, rmse, r2
+    return preds_all, targets_all, rmse, r2
 
 
 

@@ -23,6 +23,10 @@ feature_cols:
   - nino4
   - nino34
   - pdo
+  - dtr
+  - wet
+  - vap
+  - spei
 
 target_cols: 
   - spei
