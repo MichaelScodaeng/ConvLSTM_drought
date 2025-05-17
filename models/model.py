@@ -1,12 +1,37 @@
-# model.py
 import torch
 import torch.nn as nn
 import pytorch_lightning as pl
 import torchmetrics
+import gc
 
 
-def apply_masked_loss(y_pred, y_true, mask, criterion):
-    return criterion(y_pred * mask, y_true * mask)
+def inverse_transform(scaled_data, X_min, X_max):
+    """
+    Inverse transform data from scaled [-1,1] range back to original range.
+    
+    Args:
+        scaled_data: Tensor with scaled values
+        X_min: Minimum value in original scale
+        X_max: Maximum value in original scale
+    
+    Returns:
+        Tensor with values in original scale
+    """
+    X_min =  [-6.762784]
+    X_min = torch.tensor(X_min, dtype=scaled_data.dtype, device=scaled_data.device)
+    X_max = [3.886915]
+    X_max = torch.tensor(X_max, dtype=scaled_data.dtype, device=scaled_data.device)
+    X_min_tensor = torch.full_like(scaled_data, X_min.item(), dtype=scaled_data.dtype, device=scaled_data.device)
+    X_max_tensor = torch.full_like(scaled_data, X_max.item(), dtype=scaled_data.dtype, device=scaled_data.device)
+    # Perform the inverse transformation
+    inv_data = torch.add(
+        torch.mul(
+            scaled_data, 
+            torch.div(torch.sub(X_max_tensor, X_min_tensor), 2)
+        ),
+        torch.div(torch.add(X_max_tensor, X_min_tensor), 2)
+    )
+    return inv_data
 
 
 class ConvLSTMCell(nn.Module):
@@ -50,6 +75,7 @@ class ConvLSTM(nn.Module):
         super().__init__()
         self._check_kernel_size_consistency(kernel_size)
 
+        # Properly handle kernel_size and hidden_dim for multi-layer setup
         kernel_size = self._extend_for_multilayer(kernel_size, num_layers)
         hidden_dim = self._extend_for_multilayer(hidden_dim, num_layers)
 
@@ -73,12 +99,17 @@ class ConvLSTM(nn.Module):
 
     def forward(self, input_tensor, hidden_state=None):
         if not self.batch_first:
+            # (t, b, c, h, w) -> (b, t, c, h, w)
             input_tensor = input_tensor.permute(1, 0, 2, 3, 4)
 
         b, _, _, h, w = input_tensor.size()
         
-        # 🔧 PATCHED: ensure hidden_state has correct number of layers
-        if hidden_state is None or len(hidden_state) != self.num_layers:
+        # Initialize hidden state if not provided or incorrect size
+        if hidden_state is None:
+            hidden_state = self._init_hidden(b, (h, w))
+        
+        # Ensure hidden_state has the correct number of layers
+        if len(hidden_state) != self.num_layers:
             hidden_state = self._init_hidden(b, (h, w))
 
         layer_output_list = []
@@ -103,7 +134,6 @@ class ConvLSTM(nn.Module):
 
         return layer_output_list, last_state_list
 
-
     def _init_hidden(self, batch_size, image_size):
         return [self.cell_list[i].init_hidden(batch_size, image_size) for i in range(self.num_layers)]
 
@@ -124,15 +154,13 @@ class EncodingForecastingConvLSTM(nn.Module):
                  pre_seq_length, aft_seq_length, dropout=0.0, batch_first=True):
         super().__init__()
 
-        # 🔧 Ensure hidden_dim and kernel_size are lists
+        # Proper handling of hidden_dim and kernel_size
         if not isinstance(hidden_dim, list):
             hidden_dim = [hidden_dim] * num_layers
-        if not isinstance(kernel_size, list):
-            kernel_size = [kernel_size] * num_layers
-        print(f"hidden_dim: {hidden_dim}, kernel_size: {kernel_size}")
-        # Convert [3, 3] → [(3, 3), (3, 3), ...]
+            
+        # Handle different kernel_size formats
         if isinstance(kernel_size, list) and all(isinstance(k, int) for k in kernel_size):
-            # kernel_size: [3, 3] → [(3, 3), (3, 3), (3, 3)]
+            # kernel_size: [3, 3] → [(3, 3), (3, 3), ...]
             kernel_size = [tuple(kernel_size)] * num_layers
         elif isinstance(kernel_size, tuple):
             # kernel_size: (3, 3) → [(3, 3), (3, 3), (3, 3)]
@@ -140,7 +168,8 @@ class EncodingForecastingConvLSTM(nn.Module):
         elif isinstance(kernel_size, list) and all(isinstance(k, list) and len(k) == 2 for k in kernel_size):
             # kernel_size: [[3, 3], [3, 3], ...] → [(3, 3), (3, 3), ...]
             kernel_size = [tuple(k) for k in kernel_size]
-        print(f"kernel_size: {kernel_size}")
+        
+        # Initialize encoder and forecaster
         self.encoder = ConvLSTM(
             input_dim=input_dim,
             hidden_dim=hidden_dim,
@@ -167,30 +196,44 @@ class EncodingForecastingConvLSTM(nn.Module):
         self.aft_seq_length = aft_seq_length
 
     def forward(self, input_tensor):
+        """
+        Args:
+            input_tensor: 5-D Tensor of shape [b, t, c, h, w]
+        Returns:
+            output tensor of shape [b, t_out, 1, h, w]
+        """
         assert input_tensor.dim() == 5, f"Expected input_tensor to be 5D [B, T, C, H, W], got {input_tensor.shape}"
 
-        batch_size = input_tensor.size(0)
+        # Encoder phase
         encoder_outputs, encoder_states = self.encoder(input_tensor)
 
+        # Verify encoder states
         if not encoder_states or not encoder_states[-1]:
             raise RuntimeError("Encoder returned empty states. Check input shape or model definition.")
 
+        # Initialize forecaster with encoder states
         forecaster_states = encoder_states
-        next_input = encoder_states[-1][0].unsqueeze(1)
+        
+        # First input to forecaster is the last hidden state from encoder
+        next_input = encoder_states[-1][0].unsqueeze(1)  # Shape: [B, 1, hidden_dim, H, W]
 
+        # Generate predictions one time step at a time
         predictions = []
         for t in range(self.aft_seq_length):
             forecaster_output, forecaster_states = self.forecaster(next_input, forecaster_states)
             hidden_state = forecaster_output[-1][:, -1]  # [B, hidden_dim, H, W]
             pred = self.conv_last(hidden_state)  # [B, 1, H, W]
             predictions.append(pred)
-            next_input = hidden_state.unsqueeze(1)
+            
+            # Use latest prediction as next input
+            next_input = hidden_state.unsqueeze(1)  # Add time dimension
 
+        # Stack along time dimension
         return torch.stack(predictions, dim=1)  # [B, T_out, 1, H, W]
 
 
 class LightningConvLSTMModule(pl.LightningModule):
-    def __init__(self, model, lr=1e-3, weight_decay=0.0):
+    def __init__(self, model, lr=1e-3, weight_decay=0.0, X_min=None, X_max=None):
         super().__init__()
         self.model = model
         self.lr = lr
@@ -198,9 +241,19 @@ class LightningConvLSTMModule(pl.LightningModule):
         self.criterion = nn.MSELoss()
         self.save_hyperparameters(ignore=["model"])
 
+        # Store min and max values for inverse transformation
+        self.register_buffer("X_min", torch.tensor(X_min) if X_min is not None else torch.tensor(0.0))
+        self.register_buffer("X_max", torch.tensor(X_max) if X_max is not None else torch.tensor(1.0))
+
+        # Metrics
         self.train_rmse = torchmetrics.MeanSquaredError(squared=False)
         self.val_rmse = torchmetrics.MeanSquaredError(squared=False)
         self.test_rmse = torchmetrics.MeanSquaredError(squared=False)
+        
+        # Additional metrics for more comprehensive evaluation
+        self.train_r2 = torchmetrics.R2Score()
+        self.val_r2 = torchmetrics.R2Score()
+        self.test_r2 = torchmetrics.R2Score()
 
     def forward(self, x):
         return self.model(x)
@@ -208,75 +261,116 @@ class LightningConvLSTMModule(pl.LightningModule):
     def _shared_step(self, batch, stage):
         x, y, mask = batch  # x: [B, T_in, C, H, W], y: [B, T_out, C, H, W], mask: [B, 1, H, W]
 
-        # Step 1: Replace NaNs (prevents propagation)
+        # Replace NaNs to prevent propagation
         x = torch.nan_to_num(x, nan=0.0)
         y = torch.nan_to_num(y, nan=0.0)
         mask = torch.nan_to_num(mask, nan=0.0)
 
-        # Step 2: Forward pass
-        y_hat = self(x)  # [B, T_out, 1, H, W]
+        # Forward pass
+        with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+            y_hat = self(x)  # [B, T_out, 1, H, W]
 
-        if torch.isnan(y_hat).any():
-            print(f"[{stage}] ❌ Model output contains NaNs — zeroing out this batch.")
-            return torch.tensor(0.0, requires_grad=True, device=self.device)
+            # Check for NaNs in output
+            if torch.isnan(y_hat).any():
+                print(f"[{stage}] ❌ Model output contains NaNs — zeroing out this batch.")
+                return torch.tensor(0.0, requires_grad=True, device=self.device)
 
-        # Step 3: Expand mask
-        expanded_mask = mask.unsqueeze(1).expand_as(y_hat)  # [B, T, 1, H, W]
+            # Apply inverse transform to predictions and targets
+            y_hat_original = inverse_transform(y_hat, self.X_min, self.X_max) 
+            y_original = inverse_transform(y, self.X_min, self.X_max)
 
-        valid_pixel_count = expanded_mask.sum()
+            # Expand mask to match prediction shape
+            expanded_mask = mask.unsqueeze(1).expand_as(y_hat)  # [B, T, 1, H, W]
+            valid_pixel_count = expanded_mask.sum()
 
-        if valid_pixel_count == 0:
-            print(f"[{stage}] ⚠️ Skipping batch with no valid mask.")
-            return torch.tensor(0.0, requires_grad=True, device=self.device)
+            if valid_pixel_count == 0:
+                print(f"[{stage}] ⚠️ Skipping batch with no valid mask.")
+                return torch.tensor(0.0, requires_grad=True, device=self.device)
 
-        # Step 4: Compute masked loss
-        mse = (y_hat - y) ** 2
-        masked_mse = mse * expanded_mask
-        loss = masked_mse.sum() / (valid_pixel_count + 1e-8)
+            # Compute masked loss on ORIGINAL scale
+            masked_mse = ((y_hat_original - y_original) ** 2) * expanded_mask
+            loss = masked_mse.sum() / (valid_pixel_count + 1e-8)
 
-        # Step 5: Compute masked RMSE
-        pred_valid = y_hat[expanded_mask.bool()].detach()
-        true_valid = y[expanded_mask.bool()].detach()
-        rmse_metric = getattr(self, f"{stage}_rmse")
-        rmse_metric.update(pred_valid, true_valid)
+            # Also compute metrics on scaled data for comparison
+            scaled_masked_mse = ((y_hat - y) ** 2) * expanded_mask
+            scaled_loss = scaled_masked_mse.sum() / (valid_pixel_count + 1e-8)
 
-        # Step 6: Debug sample stats
-        if self.global_step == 0 and stage == "train":
-            print("📊 Sample stats:")
-            print("x[0] min/max:", x[0].min().item(), x[0].max().item())
-            print("y[0] min/max:", y[0].min().item(), y[0].max().item())
-            print("mask valid %:", mask.sum().item() / mask.numel() * 100)
+            # Extract valid predictions and targets for metrics
+            pred_valid = y_hat_original[expanded_mask.bool()].detach()
+            true_valid = y_original[expanded_mask.bool()].detach()
 
-        # Step 7: Logging
-        self.log(f"{stage}_loss", loss, on_step=False, on_epoch=True)
-        self.log(f"{stage}_rmse", rmse_metric.compute(), prog_bar=True, on_step=False, on_epoch=True)
+            # Update metrics
+            rmse_metric = getattr(self, f"{stage}_rmse")
+            r2_metric = getattr(self, f"{stage}_r2")
+            
+            rmse_metric.update(pred_valid, true_valid)
+            r2_metric.update(pred_valid, true_valid)
 
-        return loss if stage == "train" else None
+            # Log sample stats for first batch of training
+            if self.global_step == 0 and stage == "train":
+                print("\n📊 Sample stats:")
+                print(f"x shape: {x.shape}, y shape: {y.shape}, mask shape: {mask.shape}")
+                print(f"y_hat shape: {y_hat.shape}")
+                print(f"x min/max: {x.min().item():.4f}/{x.max().item():.4f}")
+                print(f"y min/max: {y.min().item():.4f}/{y.max().item():.4f}")
+                print(f"y_hat min/max: {y_hat.min().item():.4f}/{y_hat.max().item():.4f}")
+                print(f"y_original min/max: {y_original.min().item():.4f}/{y_original.max().item():.4f}")
+                print(f"y_hat_original min/max: {y_hat_original.min().item():.4f}/{y_hat_original.max().item():.4f}")
+                print(f"mask valid %: {mask.sum().item() / mask.numel() * 100:.2f}%")
+                print(f"Original scale loss: {loss.item():.6f}")
+                print(f"Scaled loss: {scaled_loss.item():.6f}")
 
+            # Log metrics
+            self.log(f"{stage}_loss", loss, on_step=False, on_epoch=True)
+            self.log(f"{stage}_rmse", rmse_metric.compute(), prog_bar=True, on_step=False, on_epoch=True)
+            self.log(f"{stage}_r2", r2_metric.compute(), prog_bar=True, on_step=False, on_epoch=True)
+            
+            # Additional logging
+            self.log(f"{stage}_scaled_loss", scaled_loss, on_step=False, on_epoch=True)
 
+        # Clear memory
+        if stage != "train":
+            torch.cuda.empty_cache()
+            gc.collect()
 
+        return loss
 
     def training_step(self, batch, batch_idx):
         loss = self._shared_step(batch, "train")
         return {"loss": loss}
 
     def validation_step(self, batch, batch_idx):
-        loss = self._shared_step(batch, "val")
-        return {"val_loss": loss}
+        self._shared_step(batch, "val")
 
     def test_step(self, batch, batch_idx):
-        loss = self._shared_step(batch, "test")
-        return {"test_loss": loss}
-
-
+        self._shared_step(batch, "test")
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5, factor=0.5)
+        optimizer = torch.optim.AdamW(
+            self.parameters(), 
+            lr=self.lr, 
+            weight_decay=self.weight_decay
+        )
+        
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, 
+            patience=5, 
+            factor=0.5,
+        )
+        
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
                 "monitor": "val_loss",
+                "interval": "epoch",
+                "frequency": 1
             }
         }
+
+    def on_epoch_end(self):
+        # Print current metrics at the end of each epoch
+        print(f"\nEpoch {self.current_epoch} completed")
+        print(f"Train RMSE: {self.train_rmse.compute():.4f}, R²: {self.train_r2.compute():.4f}")
+        print(f"Val RMSE: {self.val_rmse.compute():.4f}, R²: {self.val_r2.compute():.4f}")
+        print(f"Learning rate: {self.optimizers().param_groups[0]['lr']:.6f}")
